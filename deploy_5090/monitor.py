@@ -8,6 +8,12 @@ def status():
  inv=json.loads((ROOT/'inventory.json').read_text());top=json.loads((ROOT/'topology.json').read_text());q=rpc(top['server_url'],'status',{})
  return {'updated_utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),'inventory':inv,'topology':top,'counts':q['counts'],'rpc_ms':q.get('rpc_ms',{}),'input_scan_complete':inv['complete'],'progress_of_discovered_tasks':q['counts'].get('done',0)/max(sum(q['counts'].values()),1),'progress_is_full_batch':inv['complete']}
 def finalize(s):
+ if (ROOT/'partial_export.json').exists():
+  sys.path.insert(0,str(PROJECT/'deploy_5090'))
+  from export_results import finalize as merge_incrementally
+  return merge_incrementally(s)
+ if (ROOT/'partial_export_requested.json').exists():
+  raise RuntimeError('Waiting for verified partial export before final incremental merge')
  out=ROOT/'camera_pose_results_all.json';tmp=out.with_suffix('.tmp');c=sqlite3.connect('file:'+json.loads((ROOT/'topology.json').read_text())['queue_db']+'?mode=ro',uri=True,timeout=60)
  n=0;seconds=0.;h=hashlib.sha256();seen=set()
  with tmp.open('wb',buffering=8*1024*1024) as f:
