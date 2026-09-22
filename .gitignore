@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+/runs/
+/results/
+/hand_pose_bench/
+/vggt_omega_repo/
+/vggttt_repo/
+/camera_motion_filter/output/
+*.pt
+*.pth
+*.npz
+*.parquet
+*.sqlite*
+*.log
+/runtime/

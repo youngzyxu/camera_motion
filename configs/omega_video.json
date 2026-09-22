@@ -1,0 +1,12 @@
+{
+  "model": "VGGT-Omega-1B-512",
+  "fps": 8,
+  "window": 240,
+  "overlap": 48,
+  "stride": 192,
+  "preprocessing": "max_size512",
+  "stitch": "orientation_sim3_irls12_blend_v1",
+  "translation_units": "arbitrary",
+  "evidence": "/mnt/pfs/pfs-yc2F4O/modelTeam/code/xuzhiyong/explore_project/camera_motion/results/omega_window_study/REPORT.md",
+  "selection_all_gates_satisfied": true
+}
