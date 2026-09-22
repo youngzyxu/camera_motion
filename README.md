@@ -84,3 +84,10 @@ CUDA_VISIBLE_DEVICES=1 /mnt/pfs/pfs-yc2F4O/miniconda3/envs/camera_motion/bin/pyt
 ## 综合试验报告与流水线加速
 
 [飞书：《camera pose消融试验记录报告》](https://ucn81zkkano6.feishu.cn/docx/Ealed6Zy0o9Bbhxo3LgcDIoAnld)。固定2048条、同一八卡模型的实测：串行706.82秒，解码/上传流水线406.47秒，加速1.74倍，2048对NPZ逐位一致。八卡外推1994.8视频小时/天，平均每卡249.4小时/天；包括BOS回读校验，不包括模型启动。详见 `results/lerobot_pipeline_ab/summary.json`。
+
+## RTX 5090 多机续跑
+
+`deploy_5090/` 提供本批 chenqi egomixed 数据的 18 台 × 8 卡部署：统一队列、
+本地预取/常驻模型、持久化断点、网络异常重连和吞吐统计。
+部署说明见 [deploy_5090/README.md](deploy_5090/README.md)，
+停机和换机操作见 [deploy_5090/OPERATIONS.md](deploy_5090/OPERATIONS.md)。
