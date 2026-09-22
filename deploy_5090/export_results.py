@@ -65,8 +65,12 @@ def export_partial(db,out):
 def merge_final(db,base,out,expected):
  out=Path(out);src=Path(base['local_json']);ids=Path(base['ids_path'])
  assert base['bos_readback_sha256_verified'] and digest(ids)==base['ids_sha256']
+ # Keep the million-key membership index on the server's local disk/cache.
+ local_ids=Path(db).parent/(out.stem+'.base_ids.sqlite');shutil.copyfile(ids,local_ids)
+ assert digest(local_ids)==base['ids_sha256']
  c=sqlite3.connect('file:'+str(db)+'?mode=ro',uri=True,timeout=60)
- c.execute('ATTACH DATABASE ? AS exported',('file:'+str(ids)+'?mode=ro',))
+ c.execute('ATTACH DATABASE ? AS exported',('file:'+str(local_ids)+'?mode=ro',))
+ c.execute('PRAGMA exported.cache_size=-262144')
  c.execute('BEGIN');counts=dict(c.execute('SELECT status,count(*) FROM tasks GROUP BY status'))
  assert counts.get('done',0)==expected and not sum(v for k,v in counts.items() if k!='done'),counts
  assert c.execute('SELECT count(*) FROM exported.included').fetchone()[0]==base['records']
@@ -81,12 +85,12 @@ def merge_final(db,base,out,expected):
     original.update(b);emit(b);left-=len(b)
    tail=old.read();original.update(tail);assert tail==b'\n]\n'
   assert original.hexdigest()==base['sha256'],'Base JSON hash changed'
-  for tid,raw,res in c.execute("SELECT t.id,t.task,t.result FROM tasks t WHERE t.status='done' AND NOT EXISTS(SELECT 1 FROM exported.included b WHERE b.id=t.id) ORDER BY t.rowid"):
+  for tid,raw,res in c.execute("SELECT t.id,t.task,t.result FROM tasks t NOT INDEXED WHERE t.status='done' AND NOT EXISTS(SELECT 1 FROM exported.included b WHERE b.id=t.id) ORDER BY t.rowid"):
    item,sec,_=record(tid,raw,res)
    if n:emit(b',\n')
    emit(json.dumps(item,ensure_ascii=False,separators=(',',':')).encode());n+=1;delta+=1;seconds+=sec
   emit(b'\n]\n')
- c.close();assert n==expected;os.replace(tmp,out)
+ c.close();local_ids.unlink();assert n==expected;os.replace(tmp,out)
  return {'kind':'complete','complete':True,'records':n,'base_records':base['records'],'delta_records':delta,'video_hours':seconds/3600,'sha256':h.hexdigest(),'bytes':out.stat().st_size,'merged_utc':datetime.datetime.now(datetime.timezone.utc).isoformat()}
 
 def finalize(s):
