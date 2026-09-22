@@ -14,7 +14,7 @@ def load_model(method):
     if method == 'omega':
         from vggt_omega.models import VGGTOmega
         model = VGGTOmega()
-        model.load_state_dict(torch.load('/mnt/pfs/pfs-yc2F4O/modelTeam/code/xuzhiyong/backup/vggt_omega_1b_512.pt',map_location='cpu',weights_only=True),strict=True)
+        model.load_state_dict(torch.load(os.environ.get('CAMERA_OMEGA_WEIGHTS','/mnt/pfs/pfs-yc2F4O/modelTeam/code/xuzhiyong/backup/vggt_omega_1b_512.pt'),map_location='cpu',weights_only=True),strict=True)
         model.dense_head = None
     else:
         from vggttt.nets.vggt.models.vggt import VGGT

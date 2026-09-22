@@ -25,11 +25,16 @@ class Job:
    try:
     if not rpc(server,'heartbeat',self.token)['accepted']:self.errors.append('stale lease');return
    except Exception as e:print('HEARTBEAT_RETRY',str(e),flush=True)
- def close(self):self.stop.set();self.thread.join(timeout=25)
+ def close(self):
+  self.stop.set();self.thread.join(timeout=25)
+  if hasattr(self,'local_video'):self.local_video.unlink(missing_ok=True)
 
 def decode(job,packets):
  """Only CPU work; retain <=240 images plus a bounded packet queue."""
- video=Path(job.task['video']);cap=cv2.VideoCapture(str(video));srcfps=cap.get(5);n=int(cap.get(7))
+ video=getattr(job,'local_video',Path(job.task['video']))
+ threads=int(os.environ.get('CAMERA_DECODE_THREADS','0'))
+ cap=cv2.VideoCapture(str(video),cv2.CAP_FFMPEG,[cv2.CAP_PROP_N_THREADS,threads]) if threads else cv2.VideoCapture(str(video))
+ srcfps=cap.get(5);n=int(cap.get(7))
  if not np.isfinite(srcfps) or srcfps<=0 or n<1:cap.release();raise ValueError('Invalid source FPS or frame count')
  idx=sample_indices(n,srcfps,4);wanted=set(idx.tolist())
  job.idx=idx;job.srcfps=srcfps;job.n=n;job.decode_s=0.;job.queue_put_wait_s=0.
@@ -64,10 +69,20 @@ def run(a,model):
     with (stage/'failed.jsonl').open('a') as f:f.write(json.dumps(record)+'\n')
    job.close();slots.release()
   print('FAILED',str(error),flush=True)
+ prefetch=os.environ.get('CAMERA_PREFETCH_LOCAL')=='1';prepared=queue.Queue(maxsize=2)
+ def decode_prepared():
+  try:
+   while True:
+    job=prepared.get()
+    if job is None:break
+    try:decode(job,packets)
+    except Exception as e:packets.put(('error',job,e))
+  finally:packets.put(('stop',))
  def producer():
   try:
    while time.monotonic()<deadline and not (a.stop_file and Path(a.stop_file).exists()):
     slots.acquire()
+    if a.stop_file and Path(a.stop_file).exists():slots.release();break
     claim_started=time.monotonic()
     try:response=rpc(a.server,'claim',{'client_id':socket.gethostname()+':'+str(os.getpid())})
     except Exception as error:
@@ -78,12 +93,23 @@ def run(a,model):
     if task is None:
      slots.release()
      if response['exhausted'] and not a.stay_alive:break
-     time.sleep(.2);continue
+     time.sleep(2);continue
     job=Job(task,stage,a.server);job.claim_rpc_s=time.monotonic()-claim_started
-    try:decode(job,packets)
-    except Exception as e:packets.put(('error',job,e))
+    try:
+     if prefetch:
+      source=Path(task['video']);job.local_video=job.dest.parent/('source'+source.suffix)
+      t=time.monotonic()
+      if shutil.disk_usage(stage).free<source.stat().st_size+2*1024**3:raise RuntimeError('Local staging disk below reserve')
+      shutil.copyfile(source,job.local_video);job.prefetch_s=time.monotonic()-t
+      prepared.put(job)
+     else:decode(job,packets)
+    except Exception as e:
+     if prefetch:failed(job,e)
+     else:packets.put(('error',job,e))
   except Exception as e:packets.put(('fatal',e))
-  finally:packets.put(('stop',))
+  finally:
+   if prefetch:prepared.put(None)
+   else:packets.put(('stop',))
  def upload(job,row):
   try:
    t=time.monotonic();task=job.task;dest=job.dest
@@ -96,11 +122,11 @@ def run(a,model):
      assert hashlib.sha256(check.read_bytes()).hexdigest()==hashes[suffix],'BOS checksum mismatch';check.unlink()
    marker={'task_id':task['task_id'],'lease_id':task['lease_id'],'config':CONFIG,'sha256':hashes,'video':task['video'],'remote':remote,'readback_verified':a.verify_upload}
    dump(dest.parent/'SUCCESS.json',marker);transfer(dest.parent/'SUCCESS.json',remote+'/SUCCESS.json')
-   row.update(upload_s=time.monotonic()-t,task_wall_s=time.monotonic()-job.started,remote=remote,readback_verified=a.verify_upload)
+   row.update(prefetch_s=getattr(job,'prefetch_s',0.),upload_s=time.monotonic()-t,task_wall_s=time.monotonic()-job.started,remote=remote,readback_verified=a.verify_upload)
    if job.errors:raise RuntimeError(str(job.errors))
    ack_started=time.monotonic()
    assert rpc(a.server,'complete',{**job.token,'ok':True,'metrics':row})['accepted'],'Completion rejected'
-   row['complete_ack_s']=time.monotonic()-ack_started;row['claim_rpc_s']=getattr(job,'claim_rpc_s',0.)
+   row['completed_unix']=time.time();row['complete_ack_s']=time.monotonic()-ack_started;row['claim_rpc_s']=getattr(job,'claim_rpc_s',0.)
    with lock:
     records.append(row)
     with (stage/'completed.jsonl').open('a') as f:f.write(json.dumps(row)+'\n')
@@ -108,7 +134,8 @@ def run(a,model):
    print('COMPLETE',len(records),task['episode'],round(row['video_seconds'],2),flush=True)
    job.close();slots.release()
   except Exception as e:failed(job,e)
- producer_thread=threading.Thread(target=producer,daemon=True);producer_thread.start();pool=ThreadPoolExecutor(max_workers=2)
+ if prefetch:threading.Thread(target=decode_prepared,daemon=True).start()
+ producer_thread=threading.Thread(target=producer,daemon=True);producer_thread.start();pool=ThreadPoolExecutor(max_workers=int(os.environ.get('CAMERA_UPLOAD_WORKERS','2')))
  active=None;gpu_wait=0.;fatal=None
  while True:
   t=time.monotonic();packet=packets.get();gpu_wait+=time.monotonic()-t;kind=packet[0]
@@ -131,7 +158,7 @@ def run(a,model):
    try:
     t=time.monotonic();pose,k,joins=stitch(job.preds,job.spans);stitch_s=time.monotonic()-t
     assert len(pose)==len(job.idx) and np.isfinite(pose).all()
-    row={'video':job.task['video'],'fps':4,'window':240,'overlap':36,'windows':len(job.spans),'sampled_frames':len(job.idx),'source_frames':job.n,'source_fps':job.srcfps,'video_seconds':job.n/job.srcfps,'max_window_input_frames':max(e-s for s,e in job.spans),'processed_window_frames':sum(e-s for s,e in job.spans),'inference_s':job.inference_s,'upload_and_stack_s':job.h2d_s,'decode_preprocess_s':job.decode_s,'decoder_queue_wait_s':job.queue_put_wait_s,'stitch_s':stitch_s,'end_to_end_s':time.monotonic()-job.started,'peak_allocated_gib':torch.cuda.max_memory_allocated()/2**30,'peak_reserved_gib':torch.cuda.max_memory_reserved()/2**30,'joins':joins,'scale_fallbacks':sum(j['scale_fallback'] for j in joins),'stitch_version':'orientation_sim3_irls12_blend_v1','status':'ok','task':job.task,'config':CONFIG,'pipeline':'decode1_queue2_gpu1_upload2_inflight4','include_last_frame':True,'sampling_version':'4fps_include_last_v1','preprocessing':'max_size512','pose_convention':'OpenCV c2w; first camera origin; arbitrary translation scale'}
+    row={'video':job.task['video'],'fps':4,'window':240,'overlap':36,'windows':len(job.spans),'sampled_frames':len(job.idx),'source_frames':job.n,'source_fps':job.srcfps,'video_seconds':job.n/job.srcfps,'max_window_input_frames':max(e-s for s,e in job.spans),'processed_window_frames':sum(e-s for s,e in job.spans),'inference_s':job.inference_s,'upload_and_stack_s':job.h2d_s,'decode_preprocess_s':job.decode_s,'decoder_queue_wait_s':job.queue_put_wait_s,'stitch_s':stitch_s,'end_to_end_s':time.monotonic()-job.started,'peak_allocated_gib':torch.cuda.max_memory_allocated()/2**30,'peak_reserved_gib':torch.cuda.max_memory_reserved()/2**30,'joins':joins,'scale_fallbacks':sum(j['scale_fallback'] for j in joins),'stitch_version':'orientation_sim3_irls12_blend_v1','status':'ok','task':job.task,'config':CONFIG,'pipeline':('prefetch1_decode1_queue2_gpu1_upload'+os.environ.get('CAMERA_UPLOAD_WORKERS','2')+'_inflight4' if prefetch else 'decode1_queue2_gpu1_upload2_inflight4'),'include_last_frame':True,'sampling_version':'4fps_include_last_v1','preprocessing':'max_size512','pose_convention':'OpenCV c2w; first camera origin; arbitrary translation scale'}
     t=time.monotonic();np.savez_compressed(str(job.dest)+'.npz',c2w=pose.astype(np.float32),intrinsics=k,frame_indices=job.idx,timestamps_s=job.idx/job.srcfps,input_hw=np.array(job.hw),source_fps=job.srcfps);row['save_s']=time.monotonic()-t;dump(str(job.dest)+'.json',row)
     job.preds=[];upload_futures.append(pool.submit(upload,job,row))
    except Exception as e:failed(job,e)
@@ -139,7 +166,7 @@ def run(a,model):
  producer_thread.join();pool.shutdown(wait=True)
  for f in upload_futures:f.result()
  elapsed=time.monotonic()-begin;video=sum(r['video_seconds'] for r in records)
- result={'completed':len(records),'failed_attempts':len(failures),'wall_s':elapsed,'video_s':video,'video_hours_per_gpu_day':video/elapsed*24,'gpu_queue_wait_s':gpu_wait,'pipeline':'decode1_queue2_gpu1_upload2_inflight4','config':CONFIG,'reuse_cuda_cache':getattr(a,'reuse_cuda_cache',False)}
+ result={'completed':len(records),'failed_attempts':len(failures),'wall_s':elapsed,'video_s':video,'video_hours_per_gpu_day':video/elapsed*24,'gpu_queue_wait_s':gpu_wait,'pipeline':('prefetch1_decode1_queue2_gpu1_upload'+os.environ.get('CAMERA_UPLOAD_WORKERS','2')+'_inflight4' if prefetch else 'decode1_queue2_gpu1_upload2_inflight4'),'config':CONFIG,'reuse_cuda_cache':getattr(a,'reuse_cuda_cache',False)}
  dump(stage/'summary.json',result)
  if fatal:raise fatal
  return result

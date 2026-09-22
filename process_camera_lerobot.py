@@ -6,6 +6,7 @@ import argparse, hashlib, json, os, random, shutil, socket, sqlite3, subprocess,
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.request import Request, urlopen, build_opener, ProxyHandler
+from urllib.error import URLError, HTTPError
 QUEUE_HTTP=build_opener(ProxyHandler({}))  # Private queue traffic must not use an outbound HTTP proxy.
 ROOT=Path(__file__).resolve().parent
 BCECMD='/mnt/pfs/pfs-yc2F4O/modelTeam/code/xuzhiyong/bin/bcecmd-0.5.17-1/bcecmd'
@@ -95,12 +96,16 @@ def serve(a):
 
 def rpc(server,op,p):
  data=json.dumps(p).encode();last=None
- for attempt in range(1 if op=='status' else 3):
+ attempt=0;persistent=os.environ.get('CAMERA_RPC_RETRY')=='1' and op!='status'
+ while persistent or attempt<(1 if op=='status' else 3):
   try:
    with QUEUE_HTTP.open(Request(server.rstrip('/')+'/'+op,data=data,headers={'Content-Type':'application/json'}),timeout=120 if op=='status' else 20) as r:result=json.load(r)
    if 'error' in result:raise RuntimeError(result['error'])
    return result
-  except Exception as e:last=e;time.sleep(attempt+1)
+  except Exception as e:
+   last=e;attempt+=1
+   if persistent and (isinstance(e,HTTPError) and e.code<500 or not isinstance(e,(URLError,TimeoutError,ConnectionError,OSError))):raise
+   time.sleep(min(attempt,10))
  raise last
 
 def transfer(src,dst):
