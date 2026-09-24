@@ -17,3 +17,7 @@ __pycache__/
 
 # Historical filter artifacts are retained on disk, outside deployment source control.
 /camera_motion_filter/
+
+# Local experiment records and deployment files.
+/camera pose消融试验记录报告.md
+/deploy_5090/
