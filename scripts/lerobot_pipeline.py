@@ -37,12 +37,19 @@ def decode(job,packets):
  srcfps=cap.get(5);n=int(cap.get(7))
  if not np.isfinite(srcfps) or srcfps<=0 or n<1:cap.release();raise ValueError('Invalid source FPS or frame count')
  idx=sample_indices(n,srcfps,4);wanted=set(idx.tolist())
- job.idx=idx;job.srcfps=srcfps;job.n=n;job.decode_s=0.;job.queue_put_wait_s=0.
+ job.idx=idx;job.srcfps=srcfps;job.n=n;job.decode_s=0.;job.queue_put_wait_s=0.;job.host_stack_s=0.
  buffers=[];seen=0;start=0;last_full=0;spans=[];segment=time.monotonic()
  def emit(end):
   nonlocal segment
+  payload=buffers
+  if os.environ.get('CAMERA_PRESTACK')=='1':
+   t=time.monotonic()
+   # Stack directly into pinned host memory in the CPU producer. The same
+   # float32 values/layout reach the GPU; packet ownership keeps storage alive.
+   payload=torch.empty((len(buffers),*buffers[0].shape),dtype=buffers[0].dtype,pin_memory=True)
+   torch.stack(buffers,out=payload);job.host_stack_s+=time.monotonic()-t
   job.decode_s+=time.monotonic()-segment
-  t=time.monotonic();packets.put(('window',job,start,end,buffers));job.queue_put_wait_s+=time.monotonic()-t;spans.append((start,end));segment=time.monotonic()
+  t=time.monotonic();packets.put(('window',job,start,end,payload));job.queue_put_wait_s+=time.monotonic()-t;spans.append((start,end));segment=time.monotonic()
  try:
   for f in range(n):
    if not cap.grab():raise ValueError(f'Incomplete decode {f}/{n}')
@@ -70,6 +77,33 @@ def run(a,model):
    job.close();slots.release()
   print('FAILED',str(error),flush=True)
  prefetch=os.environ.get('CAMERA_PREFETCH_LOCAL')=='1';prepared=queue.Queue(maxsize=2)
+ async_reuse=prefetch and os.environ.get('CAMERA_ASYNC_REUSE')=='1'
+ reuse_pool=ThreadPoolExecutor(max_workers=1) if async_reuse else None
+ def prepare_job(job):
+  try:
+   task=job.task
+   if task.get('reuse_camera'):
+    try:
+     from reuse_camera import prepare_reuse
+     t=time.monotonic();row=prepare_reuse(task,job.dest,transfer,CONFIG)
+     row['reuse_validation_s']=time.monotonic()-t
+     dump(str(job.dest)+'.json',row)
+     if async_reuse:upload_futures.append(pool.submit(upload,job,row))
+     else:packets.put(('reuse',job,row))
+     return
+    except Exception as e:
+     job.reuse_fallback_reason=str(e) or type(e).__name__
+     print('REUSE_FALLBACK',task['task_id'],job.reuse_fallback_reason,flush=True)
+   if prefetch:
+    source=Path(task['video']);job.local_video=job.dest.parent/('source'+source.suffix)
+    t=time.monotonic()
+    if shutil.disk_usage(stage).free<source.stat().st_size+2*1024**3:raise RuntimeError('Local staging disk below reserve')
+    shutil.copyfile(source,job.local_video);job.prefetch_s=time.monotonic()-t
+    prepared.put(job)
+   else:decode(job,packets)
+  except Exception as e:
+   if prefetch:failed(job,e)
+   else:packets.put(('error',job,e))
  def decode_prepared():
   try:
    while True:
@@ -78,6 +112,9 @@ def run(a,model):
     try:decode(job,packets)
     except Exception as e:packets.put(('error',job,e))
   finally:packets.put(('stop',))
+ def prepare_async(job):
+  try:prepare_job(job)
+  except Exception as e:packets.put(('fatal',e))
  def producer():
   try:
    while time.monotonic()<deadline and not (a.stop_file and Path(a.stop_file).exists()):
@@ -95,19 +132,12 @@ def run(a,model):
      if response['exhausted'] and not a.stay_alive:break
      time.sleep(2);continue
     job=Job(task,stage,a.server);job.claim_rpc_s=time.monotonic()-claim_started
-    try:
-     if prefetch:
-      source=Path(task['video']);job.local_video=job.dest.parent/('source'+source.suffix)
-      t=time.monotonic()
-      if shutil.disk_usage(stage).free<source.stat().st_size+2*1024**3:raise RuntimeError('Local staging disk below reserve')
-      shutil.copyfile(source,job.local_video);job.prefetch_s=time.monotonic()-t
-      prepared.put(job)
-     else:decode(job,packets)
-    except Exception as e:
-     if prefetch:failed(job,e)
-     else:packets.put(('error',job,e))
+    if async_reuse and task.get('reuse_camera'):reuse_pool.submit(prepare_async,job)
+    else:prepare_job(job)
   except Exception as e:packets.put(('fatal',e))
   finally:
+   # All reuse packets and fallback decode jobs must precede the stop sentinel.
+   if reuse_pool:reuse_pool.shutdown(wait=True)
    if prefetch:prepared.put(None)
    else:packets.put(('stop',))
  def upload(job,row):
@@ -134,14 +164,17 @@ def run(a,model):
    print('COMPLETE',len(records),task['episode'],round(row['video_seconds'],2),flush=True)
    job.close();slots.release()
   except Exception as e:failed(job,e)
+ pool=ThreadPoolExecutor(max_workers=int(os.environ.get('CAMERA_UPLOAD_WORKERS','2')))
  if prefetch:threading.Thread(target=decode_prepared,daemon=True).start()
- producer_thread=threading.Thread(target=producer,daemon=True);producer_thread.start();pool=ThreadPoolExecutor(max_workers=int(os.environ.get('CAMERA_UPLOAD_WORKERS','2')))
+ producer_thread=threading.Thread(target=producer,daemon=True);producer_thread.start()
  active=None;gpu_wait=0.;fatal=None
  while True:
   t=time.monotonic();packet=packets.get();gpu_wait+=time.monotonic()-t;kind=packet[0]
   if kind=='stop':break
   if kind=='fatal':fatal=packet[1];continue
   job=packet[1]
+  if kind=='reuse':
+   upload_futures.append(pool.submit(upload,job,packet[2]));continue
   if kind=='error':failed(job,packet[2]);active=None;continue
   if active is not job:
    active=job;job.preds=[];job.inference_s=0.;job.h2d_s=0.;job.gpu_error=None
@@ -150,7 +183,9 @@ def run(a,model):
   if kind=='window':
    if job.gpu_error:continue
    try:
-    _,_,start,end,buffer=packet;t=time.monotonic();x=torch.stack(buffer).cuda();torch.cuda.synchronize();job.h2d_s+=time.monotonic()-t;job.hw=x.shape[-2:]
+    _,_,start,end,buffer=packet;t=time.monotonic()
+    x=buffer.cuda(non_blocking=True) if isinstance(buffer,torch.Tensor) else torch.stack(buffer).cuda()
+    torch.cuda.synchronize();job.h2d_s+=time.monotonic()-t;job.hw=x.shape[-2:]
     t=time.monotonic();p,k=predict(model,x,'omega');torch.cuda.synchronize();job.inference_s+=time.monotonic()-t;job.preds.append((p,k));del x,buffer
    except Exception as e:job.gpu_error=e;torch.cuda.empty_cache()
   elif kind=='end':
@@ -159,6 +194,8 @@ def run(a,model):
     t=time.monotonic();pose,k,joins=stitch(job.preds,job.spans);stitch_s=time.monotonic()-t
     assert len(pose)==len(job.idx) and np.isfinite(pose).all()
     row={'video':job.task['video'],'fps':4,'window':240,'overlap':36,'windows':len(job.spans),'sampled_frames':len(job.idx),'source_frames':job.n,'source_fps':job.srcfps,'video_seconds':job.n/job.srcfps,'max_window_input_frames':max(e-s for s,e in job.spans),'processed_window_frames':sum(e-s for s,e in job.spans),'inference_s':job.inference_s,'upload_and_stack_s':job.h2d_s,'decode_preprocess_s':job.decode_s,'decoder_queue_wait_s':job.queue_put_wait_s,'stitch_s':stitch_s,'end_to_end_s':time.monotonic()-job.started,'peak_allocated_gib':torch.cuda.max_memory_allocated()/2**30,'peak_reserved_gib':torch.cuda.max_memory_reserved()/2**30,'joins':joins,'scale_fallbacks':sum(j['scale_fallback'] for j in joins),'stitch_version':'orientation_sim3_irls12_blend_v1','status':'ok','task':job.task,'config':CONFIG,'pipeline':('prefetch1_decode1_queue2_gpu1_upload'+os.environ.get('CAMERA_UPLOAD_WORKERS','2')+'_inflight4' if prefetch else 'decode1_queue2_gpu1_upload2_inflight4'),'include_last_frame':True,'sampling_version':'4fps_include_last_v1','preprocessing':'max_size512','pose_convention':'OpenCV c2w; first camera origin; arbitrary translation scale'}
+    if hasattr(job,'reuse_fallback_reason'):row['reuse_fallback_reason']=job.reuse_fallback_reason
+    row.update(host_stack_s=getattr(job,'host_stack_s',0.),prestack=os.environ.get('CAMERA_PRESTACK')=='1',async_reuse=async_reuse)
     t=time.monotonic();np.savez_compressed(str(job.dest)+'.npz',c2w=pose.astype(np.float32),intrinsics=k,frame_indices=job.idx,timestamps_s=job.idx/job.srcfps,input_hw=np.array(job.hw),source_fps=job.srcfps);row['save_s']=time.monotonic()-t;dump(str(job.dest)+'.json',row)
     job.preds=[];upload_futures.append(pool.submit(upload,job,row))
    except Exception as e:failed(job,e)
